@@ -1,0 +1,34 @@
+const express=require('express');const http=require('http');const path=require('path');const QRCode=require('qrcode');const {Server}=require('socket.io');
+const app=express(),server=http.createServer(app),io=new Server(server);const PORT=process.env.PORT||3000;const rooms=new Map();
+const avatars=['html','css','programador','gamer','github','cpu','professor','professor-1','caderno','caneta','borracha','cadeira','caixa-de-som','celular','fone-com-redi','fone-de-ouvido','gps','mesa','monitor','mouse','notebook','placa-mae','regua','tablet','teclado','vscode','webcam'];
+const questions=[
+{category:'HTML',question:'Qual tag HTML cria um link clicável?',options:['<a>','<link>','<href>','<url>'],answer:0,explanation:'A tag <a> cria links.'},
+{category:'HTML',question:'Qual atributo define o texto alternativo de uma imagem?',options:['src','title','alt','text'],answer:2,explanation:'O atributo alt melhora acessibilidade e descreve a imagem.'},
+{category:'HTML',question:'Qual elemento cria uma lista não ordenada?',options:['<ol>','<ul>','<li>','<list>'],answer:1,explanation:'A tag <ul> cria uma lista não ordenada.'},
+{category:'HTML',question:'Qual tag representa o título principal do conteúdo?',options:['<head>','<h1>','<title>','<header>'],answer:1,explanation:'<h1> representa o título principal.'},
+{category:'CSS',question:'Qual propriedade muda a cor do texto?',options:['font-color','text-color','color','foreground'],answer:2,explanation:'A propriedade color define a cor do texto.'},
+{category:'CSS',question:'Qual propriedade define a cor de fundo?',options:['background-color','bgcolor','color-background','fill'],answer:0,explanation:'background-color define a cor de fundo.'},
+{category:'CSS',question:'Qual declaração ativa o Flexbox?',options:['position:flex','display:flex','flex:on','layout:flex'],answer:1,explanation:'display:flex ativa o Flexbox.'},
+{category:'JavaScript',question:'Como declarar uma constante?',options:['constant x=10;','let const x=10;','const x=10;','fixed x=10;'],answer:2,explanation:'const declara uma variável que não recebe nova atribuição.'},
+{category:'JavaScript',question:'Qual comando mostra uma mensagem no console?',options:['console.log()','print()','browser.log()','show()'],answer:0,explanation:'console.log() escreve no console do navegador.'},
+{category:'JavaScript',question:'Qual operador faz comparação estrita?',options:['=','==','===','=>'],answer:2,explanation:'=== compara valor e tipo.'}
+];
+app.use(express.static(path.join(__dirname,'public')));
+function pin(){let p;do{p=String(Math.floor(100000+Math.random()*900000))}while(rooms.has(p));return p}function clean(v){return String(v||'Jogador').trim().replace(/\s+/g,' ').slice(0,20)||'Jogador'}
+function state(r){return{pin:r.pin,status:r.status,currentQuestion:r.currentQuestion,totalQuestions:questions.length,timePerQuestion:r.timePerQuestion,players:[...r.players.values()].map(p=>({...p}))}}
+function broadcast(r){io.to(r.pin).emit('room:update',state(r))}
+function sendQuestion(r){const q=questions[r.currentQuestion];r.status='playing';r.deadline=Date.now()+r.timePerQuestion*1000;r.players.forEach(p=>{p.answered=false;p.answerCorrect=null});io.to(r.pin).emit('quiz:question',{...q,index:r.currentQuestion,total:questions.length,deadline:r.deadline,duration:r.timePerQuestion});broadcast(r)}
+function review(r,auto=false){if(r.status!=='playing')return;r.status='review';const q=questions[r.currentQuestion];io.to(r.pin).emit('quiz:result',{correctIndex:q.answer,correctAnswer:q.options[q.answer],explanation:q.explanation,auto});broadcast(r)}
+function finish(r){r.status='finished';const podium=[...r.players.values()].sort((a,b)=>b.score-a.score).slice(0,3).map((p,i)=>({place:i+1,name:p.name,avatar:p.avatar,score:p.score}));io.to(r.pin).emit('quiz:finished',{podium});broadcast(r)}
+app.get('/api/qr/:pin',async(req,res)=>{const r=rooms.get(req.params.pin);if(!r)return res.status(404).json({error:'Sala não encontrada'});const base=`${req.protocol}://${req.get('host')}/?pin=${r.pin}`;res.json({url:base,dataUrl:await QRCode.toDataURL(base,{width:420,margin:2})})});
+io.on('connection',s=>{
+ s.on('host:create',({timePerQuestion=20}={})=>{const r={pin:pin(),hostId:s.id,status:'lobby',currentQuestion:-1,timePerQuestion:Math.max(10,Math.min(60,Number(timePerQuestion)||20)),deadline:0,players:new Map()};rooms.set(r.pin,r);s.join(r.pin);s.data={role:'host',pin:r.pin};s.emit('host:created',{pin:r.pin});broadcast(r)});
+ s.on('host:resume',({pin:p})=>{const r=rooms.get(String(p||''));if(!r||r.hostId!==s.id)return s.emit('app:error','Sala não encontrada.');s.join(r.pin);s.data={role:'host',pin:r.pin};s.emit('host:created',{pin:r.pin});broadcast(r)});
+ s.on('player:join',({pin:p,name,avatar})=>{const r=rooms.get(String(p||''));if(!r)return s.emit('app:error','PIN inválido.');if(r.status!=='lobby')return s.emit('app:error','A partida já começou.');const a=avatars.includes(avatar)?avatar:'gamer';const player={id:s.id,name:clean(name),avatar:a,score:0,answered:false,answerCorrect:null};r.players.set(s.id,player);s.join(r.pin);s.data={role:'player',pin:r.pin};s.emit('player:joined',{name:player.name,avatar:a});broadcast(r)});
+ s.on('host:start',({pin:p})=>{const r=rooms.get(String(p||''));if(!r||r.hostId!==s.id)return;if(!r.players.size)return s.emit('app:error','Aguarde pelo menos um aluno.');r.currentQuestion=0;sendQuestion(r)});
+ s.on('host:openReview',({pin:p})=>{const r=rooms.get(String(p||''));if(r&&r.hostId===s.id)review(r)});
+ s.on('host:next',({pin:p})=>{const r=rooms.get(String(p||''));if(!r||r.hostId!==s.id)return;if(r.currentQuestion>=questions.length-1)return finish(r);r.currentQuestion++;sendQuestion(r)});
+ s.on('player:answer',({pin:p,option})=>{const r=rooms.get(String(p||''));if(!r||r.status!=='playing')return;const pl=r.players.get(s.id),q=questions[r.currentQuestion];if(!pl||pl.answered)return;const i=Number(option),correct=i===q.answer;pl.answered=true;pl.answerCorrect=correct;let gained=0;if(correct){gained=300+Math.round(Math.max(0,r.deadline-Date.now())/(r.timePerQuestion*1000)*700);pl.score+=gained}s.emit('player:answerResult',{correct,gained,total:pl.score,correctIndex:q.answer});broadcast(r);if([...r.players.values()].every(x=>x.answered))review(r)});
+ s.on('host:reset',({pin:p})=>{const r=rooms.get(String(p||''));if(!r||r.hostId!==s.id)return;r.status='lobby';r.currentQuestion=-1;r.players.forEach(p=>{p.score=0;p.answered=false;p.answerCorrect=null});io.to(r.pin).emit('quiz:reset');broadcast(r)});
+ s.on('disconnect',()=>{const r=s.data?.pin&&rooms.get(s.data.pin);if(!r)return;if(r.hostId===s.id){io.to(r.pin).emit('app:error','O professor saiu da sala.');rooms.delete(r.pin)}else{r.players.delete(s.id);broadcast(r)}})
+});setInterval(()=>{for(const r of rooms.values())if(r.status==='playing'&&Date.now()>=r.deadline)review(r,true)},250);server.listen(PORT,'0.0.0.0',()=>console.log(`THREE GAMER online na porta ${PORT}`));
